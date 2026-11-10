@@ -1,0 +1,110 @@
+---
+# metrics-server.yml — installs metrics-server (Metrics API for k9s, kubectl top, HPA) on a running cluster.
+# Run AFTER site.yml, with metrics-server-addon.tar.gz built by prepare-metrics-server.sh:
+#   ansible-playbook metrics-server.yml
+# Idempotent: safe to run again. (To use a newer add-on tarball, delete /opt/metrics-server-addon on the nodes.)
+
+- name: "A. Preflight"
+  hosts: cp_first
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Files exist on the controller
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ metrics_addon_tarball }}"
+        - "{{ playbook_dir }}/templates/cluster.env.j2"
+        - "{{ kit_dir }}/install-node.sh"
+      register: addon_files
+
+    - name: Must not be missing or empty
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.size > 0
+        fail_msg: "{{ item.item }} is missing or empty (build the add-on with prepare-metrics-server.sh)"
+      loop: "{{ addon_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+- name: "B. Distribute the add-on and refresh scripts / cluster.env"
+  hosts: k8s
+  gather_facts: false
+  become: true
+  tasks:
+    - name: The base bundle must already be on the node (site.yml)
+      ansible.builtin.stat:
+        path: "{{ bundle_dir }}/bundle.env"
+      register: base_bundle
+
+    - name: Fail early if site.yml was not run
+      ansible.builtin.assert:
+        that: base_bundle.stat.exists
+        fail_msg: "{{ bundle_dir }} not found on {{ inventory_hostname }} - run site.yml first"
+
+    - name: Extract the add-on (once)
+      ansible.builtin.unarchive:
+        src: "{{ metrics_addon_tarball }}"
+        dest: /opt
+        owner: root
+        group: root
+        creates: "{{ addon_dir }}/VERSION"
+
+    - name: Latest install-node.sh
+      ansible.builtin.copy:
+        src: "{{ kit_dir }}/install-node.sh"
+        dest: "{{ bundle_dir }}/install-node.sh"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Re-render cluster.env (adds the metrics-server settings)
+      ansible.builtin.template:
+        src: cluster.env.j2
+        dest: "{{ bundle_dir }}/cluster.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Import the add-on images into containerd (idempotent)
+      ansible.builtin.command: "./install-node.sh import-images {{ addon_dir }}"
+      args:
+        chdir: "{{ bundle_dir }}"
+      changed_when: false
+
+- name: "C. Install metrics-server (first control-plane)"
+  hosts: cp_first
+  gather_facts: false
+  become: true
+  tasks:
+    - name: install-node.sh metrics-server
+      ansible.builtin.command: "./install-node.sh metrics-server {{ addon_dir }}"
+      args:
+        chdir: "{{ bundle_dir }}"
+      async: 900
+      poll: 10
+      register: ms_out
+      changed_when: true
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ ms_out.stdout_lines[-12:] }}"
+
+- name: "D. Verify"
+  hosts: cp_first
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Metrics API
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf get apiservice v1beta1.metrics.k8s.io
+      register: apisvc
+      changed_when: false
+
+    - name: kubectl top nodes
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf top nodes
+      register: top_nodes
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ apisvc.stdout_lines + [''] + top_nodes.stdout_lines }}"

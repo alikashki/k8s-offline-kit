@@ -1,0 +1,41 @@
+---
+# Cluster settings (rendered into cluster.env on every node)
+vip: "<Change_This>"            # keepalived VIP = Kubernetes API endpoint
+pod_cidr: "10.244.0.0/16"
+vrrp_interface: "<Change_This(like eth1 or ens33)>"
+vrrp_prefix: 24
+vrrp_id: 51
+vrrp_auth_pass: "<Change_This>"         # 1-8 alphanumerics, same on both LBs
+
+# Where things live
+kit_dir: "{{ playbook_dir }}/.."                          # folder holding install-node.sh / install-lb.sh
+bundle_tarball: "{{ kit_dir }}/k8s-offline.tar.gz"        # produced by prepare-bundle.sh
+bundle_root: /opt
+bundle_dir: "{{ bundle_root }}/k8s-offline"
+marker_dir: /var/lib/k8s-offline
+
+# Set to true (-e force_lb=true) to re-run install-lb.sh on LBs that are already configured
+force_lb: false
+
+# Join tokens / certificate keys are short-lived (2h / 24h). Default false so that ERRORS stay visible;
+# set true (-e hide_secrets=true) to hide task output, errors included.
+hide_secrets: false
+
+# CA / service-account material every additional control-plane needs before "kubeadm join --control-plane".
+# Copied from cp_first by the playbook (replaces kubeadm's upload-certs / --certificate-key mechanism).
+pki_files:
+  - ca.crt
+  - ca.key
+  - sa.key
+  - sa.pub
+  - front-proxy-ca.crt
+  - front-proxy-ca.key
+  - etcd/ca.crt
+  - etcd/ca.key
+
+# ---- metrics-server add-on (ansible-playbook metrics-server.yml) ----
+metrics_addon_tarball: "{{ kit_dir }}/metrics-server-addon.tar.gz"   # produced by prepare-metrics-server.sh
+addon_dir: /opt/metrics-server-addon
+metrics_server_replicas: 2
+# kubeadm kubelets have self-signed serving certs; true = pass --kubelet-insecure-tls (lab default)
+metrics_server_insecure_tls: true

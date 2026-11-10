@@ -1,0 +1,388 @@
+---
+# site.yml — builds the whole offline HA Kubernetes cluster, in the same order as the manual procedure:
+#   0 preflight -> 1 distribute bundle -> 2 LB master -> 3 LB slave -> 4 base on all k8s nodes
+#   -> 5 kubeadm init + cilium on cp_first -> 6 create join commands -> 7 join other control-planes
+#   -> 8 join workers -> 9 verify
+#
+#   ansible-playbook site.yml
+# Every step is guarded by a marker/file, so re-running skips what is already done.
+
+# ---------------------------------------------------------------- 0
+- name: "0. Preflight"
+  hosts: all
+  gather_facts: true
+  become: false
+  tasks:
+    - name: Inventory sanity (roles)
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - groups.get('lb_master', []) | length == 1
+          - groups.get('lb_slave', []) | length == 1
+          - groups.get('cp_first', []) | length == 1
+          - groups.get('workers', []) | length >= 1
+          - groups['control_plane'] | select('match', '^cp[0-9]+$') | list | length == groups['control_plane'] | length
+        fail_msg: >-
+          Need exactly one host in lb_master, lb_slave and cp_first, at least one worker,
+          and every control-plane host must be named cp1, cp2, ...
+
+    - name: Cluster variables sanity (group_vars/all.yml)
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - vip is defined
+          - vip | string is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}$')
+          - vrrp_auth_pass | string is match('^[0-9A-Za-z]{1,8}$')
+          - pod_cidr is defined
+        fail_msg: >-
+          Invalid cluster variables: vip must be a plain IPv4 (got '{{ vip | default("UNDEFINED") }}'),
+          vrrp_auth_pass must be 1-8 alphanumerics.
+
+    - name: Every host needs an internal node_ip in the inventory
+      ansible.builtin.assert:
+        that:
+          - node_ip is defined
+          - node_ip | string is match('^[0-9]{1,3}(\\.[0-9]{1,3}){3}$')
+        fail_msg: "{{ inventory_hostname }}: set node_ip=<internal IPv4> on its inventory line"
+
+    - name: Kit files exist on the controller
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ playbook_dir }}/templates/cluster.env.j2"
+        - "{{ kit_dir }}/install-node.sh"
+        - "{{ kit_dir }}/install-lb.sh"
+      register: kit_files
+
+    - name: Kit files must not be missing or empty
+      run_once: true
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.size > 0
+        fail_msg: "{{ item.item }} is missing or EMPTY - copy it again from the kit"
+      loop: "{{ kit_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Offline bundle exists on the Ansible controller
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ bundle_tarball }}"
+      register: bundle_stat
+
+    - name: Fail if the bundle is missing
+      run_once: true
+      ansible.builtin.assert:
+        that: bundle_stat.stat.exists
+        fail_msg: "{{ bundle_tarball }} not found - run prepare-bundle.sh first (or set bundle_tarball)."
+
+    - name: Target OS must be Debian 13
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Debian'
+          - ansible_facts['distribution_major_version'] == '13'
+        fail_msg: "{{ inventory_hostname }} is not Debian 13"
+
+    - name: Clock skew between nodes must be below 60 s (no NTP in an offline network)
+      run_once: true
+      ansible.builtin.assert:
+        that: (epochs | max) - (epochs | min) < 60
+        fail_msg: "Clocks differ by more than 60 seconds - sync time (e.g. internal chrony) first."
+      vars:
+        epochs: "{{ ansible_play_hosts_all | map('extract', hostvars, ['ansible_facts', 'date_time', 'epoch']) | map('int') | list }}"
+
+# ---------------------------------------------------------------- 1
+- name: "1. Distribute the offline bundle and cluster.env"
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Marker directory
+      ansible.builtin.file:
+        path: "{{ marker_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Is the bundle already extracted on this node?
+      ansible.builtin.stat:
+        path: "{{ bundle_dir }}/VERSION"
+      register: bundle_present
+
+    - name: Size of what will be uploaded
+      run_once: true
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ bundle_tarball }}"
+      register: full_tar
+
+    - name: Heads-up (the upload step prints nothing until it finishes)
+      run_once: true
+      ansible.builtin.debug:
+        msg: >-
+          Uploading {{ (full_tar.stat.size / 1048576) | round | int }} MB to each of
+          {{ ansible_play_hosts_all | length }} nodes. Needs about twice that free space in
+          {{ bundle_root }} on every node. Be patient.
+
+    - name: Upload the bundle (silent until done)
+      ansible.builtin.copy:
+        src: "{{ bundle_tarball }}"
+        dest: "{{ bundle_root }}/k8s-offline.tar.gz"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not bundle_present.stat.exists
+
+    - name: Extract the bundle (async, so the SSH session is not held idle)
+      ansible.builtin.command: >-
+        tar -xzf {{ bundle_root }}/k8s-offline.tar.gz -C {{ bundle_root }} --no-same-owner
+        {{ '--exclude=k8s-offline/images --exclude=k8s-offline/charts' if inventory_hostname in groups['lb'] else '' }}
+      args:
+        creates: "{{ bundle_dir }}/VERSION"
+      async: 3600
+      poll: 10
+      when: not bundle_present.stat.exists
+
+    - name: Remove the uploaded tarball (frees disk space)
+      ansible.builtin.file:
+        path: "{{ bundle_root }}/k8s-offline.tar.gz"
+        state: absent
+
+    - name: Always use the latest installer scripts from the kit
+      ansible.builtin.copy:
+        src: "{{ kit_dir }}/{{ item }}"
+        dest: "{{ bundle_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - install-node.sh
+        - install-lb.sh
+
+    - name: Render cluster.env from the inventory
+      ansible.builtin.template:
+        src: cluster.env.j2
+        dest: "{{ bundle_dir }}/cluster.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+# ---------------------------------------------------------------- 2
+- name: "2. Load balancer - MASTER first"
+  hosts: lb_master
+  gather_facts: false
+  become: true
+  tasks:
+    - name: install-lb.sh (master)
+      ansible.builtin.shell: "./install-lb.sh --role master --hostname {{ inventory_hostname }} && touch {{ marker_dir }}/lb.done"
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: "{{ omit if (force_lb | bool) else marker_dir ~ '/lb.done' }}"
+      register: lb_out
+    - name: Result
+      ansible.builtin.debug:
+        var: lb_out.stdout_lines
+      when: lb_out is changed
+
+# ---------------------------------------------------------------- 3
+- name: "3. Load balancer - SLAVE"
+  hosts: lb_slave
+  gather_facts: false
+  become: true
+  tasks:
+    - name: install-lb.sh (slave)
+      ansible.builtin.shell: "./install-lb.sh --role slave --hostname {{ inventory_hostname }} && touch {{ marker_dir }}/lb.done"
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: "{{ omit if (force_lb | bool) else marker_dir ~ '/lb.done' }}"
+      register: lb_out
+    - name: Result
+      ansible.builtin.debug:
+        var: lb_out.stdout_lines
+      when: lb_out is changed
+
+# ---------------------------------------------------------------- 4
+- name: "4. Base setup on every control-plane and worker (parallel)"
+  hosts: k8s
+  gather_facts: false
+  become: true
+  tasks:
+    - name: install-node.sh base
+      ansible.builtin.shell: "./install-node.sh base --hostname {{ inventory_hostname }} && touch {{ marker_dir }}/base.done"
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: "{{ marker_dir }}/base.done"
+      async: 1800
+      poll: 15
+
+    - name: Alias digest-pinned images so containerd's CRI finds them offline (idempotent)
+      ansible.builtin.command: ./install-node.sh alias-images
+      args:
+        chdir: "{{ bundle_dir }}"
+      changed_when: false
+
+# ---------------------------------------------------------------- 5
+- name: "5. First control-plane: kubeadm init + Cilium"
+  hosts: cp_first
+  gather_facts: false
+  become: true
+  tasks:
+    - name: The VIP must answer on 6443 (haproxy on the active LB)
+      ansible.builtin.wait_for:
+        host: "{{ vip }}"
+        port: 6443
+        timeout: 120
+
+    - name: install-node.sh init
+      ansible.builtin.shell: ./install-node.sh init
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: /etc/kubernetes/admin.conf
+      async: 1800
+      poll: 15
+
+    - name: install-node.sh cilium
+      ansible.builtin.shell: "./install-node.sh cilium && touch {{ marker_dir }}/cilium.done"
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: "{{ marker_dir }}/cilium.done"
+      async: 900
+      poll: 10
+
+# ---------------------------------------------------------------- 6
+- name: "6. Create join commands and collect the shared CA material"
+  hosts: cp_first
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Control-plane join arguments
+      ansible.builtin.command: ./install-node.sh join-cmd control-plane
+      args:
+        chdir: "{{ bundle_dir }}"
+      register: join_cp_out
+      changed_when: false
+      no_log: "{{ hide_secrets | bool }}"
+
+    - name: Worker join arguments
+      ansible.builtin.command: ./install-node.sh join-cmd worker
+      args:
+        chdir: "{{ bundle_dir }}"
+      register: join_worker_out
+      changed_when: false
+      no_log: "{{ hide_secrets | bool }}"
+
+    - name: Read the shared CA / service-account files from the first control-plane
+      ansible.builtin.slurp:
+        src: "/etc/kubernetes/pki/{{ item }}"
+      loop: "{{ pki_files }}"
+      loop_control:
+        label: "{{ item }}"
+      register: pki_slurp
+
+    - name: Keep everything for the next plays
+      ansible.builtin.set_fact:
+        join_cp: "{{ join_cp_out.stdout | trim }}"
+        join_worker: "{{ join_worker_out.stdout | trim }}"
+        pki_blobs: "{{ pki_slurp.results | map(attribute='content') | list }}"
+      no_log: true
+
+# ---------------------------------------------------------------- 7
+- name: "7. Join the other control-planes (one at a time)"
+  hosts: cp_other
+  serial: 1
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Is this node already joined?
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: joined
+
+    - name: PKI directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /etc/kubernetes/pki
+        - /etc/kubernetes/pki/etcd
+      when: not joined.stat.exists
+
+    - name: Copy the shared CA / service-account files from the first control-plane
+      ansible.builtin.copy:
+        content: "{{ item.1 | b64decode }}"
+        dest: "/etc/kubernetes/pki/{{ item.0 }}"
+        owner: root
+        group: root
+        mode: "{{ '0600' if item.0.endswith('.key') else '0644' }}"
+      loop: "{{ pki_files | zip(hostvars[groups['cp_first'][0]]['pki_blobs']) | list }}"
+      loop_control:
+        label: "{{ item.0 }}"
+      when: not joined.stat.exists
+
+    - name: install-node.sh join (control-plane)
+      ansible.builtin.shell: "./install-node.sh join {{ hostvars[groups['cp_first'][0]]['join_cp'] }}"
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: /etc/kubernetes/kubelet.conf
+      async: 1800
+      poll: 15
+      no_log: "{{ hide_secrets | bool }}"
+
+# ---------------------------------------------------------------- 8
+- name: "8. Join the workers"
+  hosts: workers
+  gather_facts: false
+  become: true
+  tasks:
+    - name: install-node.sh join (worker)
+      ansible.builtin.shell: "./install-node.sh join {{ hostvars[groups['cp_first'][0]]['join_worker'] }}"
+      args:
+        chdir: "{{ bundle_dir }}"
+        executable: /bin/bash
+        creates: /etc/kubernetes/kubelet.conf
+      async: 1800
+      poll: 15
+      no_log: "{{ hide_secrets | bool }}"
+
+# ---------------------------------------------------------------- 9
+- name: "9. Verify"
+  hosts: cp_first
+  gather_facts: false
+  become: true
+  vars:
+    expected_nodes: "{{ groups['k8s'] | length }}"
+  tasks:
+    - name: Wait until every node is Ready
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers
+      register: nodes
+      until: >-
+        nodes.stdout_lines | length == expected_nodes | int and
+        (nodes.stdout_lines | select('search', 'NotReady') | list | length == 0)
+      retries: 36
+      delay: 10
+      changed_when: false
+
+    - name: Nodes
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes_wide
+      changed_when: false
+
+    - name: kube-system pods
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -o wide
+      register: pods
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ nodes_wide.stdout_lines + [''] + pods.stdout_lines }}"
